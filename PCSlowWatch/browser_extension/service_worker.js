@@ -30,7 +30,7 @@ async function storeSample(input) {
     tab_ref: cleanToken(input.tab_ref, 64),
     site_label: cleanSite(input.site_label),
     site_category: category,
-    mail_thread_id: category === "email" ? cleanThread(input.mail_thread_id) : "",
+    mail_thread_id: category === "email" && input.site_label === "gmail" ? cleanThread(input.mail_thread_id) : "",
     visible: input.visible === true,
     resource_count: safeNumber(input.resource_count, 0, 100000, true),
     transfer_kb: safeNumber(input.transfer_kb, 0, 10000000, false),
