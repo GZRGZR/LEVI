@@ -350,6 +350,14 @@ class SlowWatchApp:
         self.interval_box = ttk.Combobox(controls, width=5, state="readonly", values=(2, 5, 10), textvariable=self.sample_interval)
         self.interval_box.pack(side="right")
 
+        extras = tk.Frame(self.root, bg="#f3f5f8", padx=18, pady=(0, 8))
+        extras.pack(fill="x")
+        ttk.Checkbutton(
+            extras, text="איסוף מפורט של תוכנות ותהליכים (ברירת מחדל פעיל)",
+            variable=self.detailed_process_var
+        ).pack(side="left")
+        ttk.Button(extras, text="ייבא מדידות דפדפן", command=self.import_browser_data).pack(side="right")
+
         self.status_var = tk.StringVar()
         tk.Label(self.root, textvariable=self.status_var, bg="#eaf0f7", fg="#2c3e55", anchor="w", padx=12, pady=8,
                  font=("Segoe UI", 9)).pack(fill="x", padx=18, pady=(0, 12))
@@ -467,6 +475,11 @@ class SlowWatchApp:
             row = self.collector.sample()
             self.current = row
             self._append_row(self._path("metrics"), METRIC_FIELDS, row)
+            if self.detailed_process_var.get() and self.collector is not None:
+                for process_row in self.collector.last_process_rows:
+                    safe_row = dict(process_row)
+                    safe_row["timestamp"] = row["timestamp"]
+                    self._append_row(self._path("processes"), PROCESS_FIELDS, safe_row)
             self.history.append(row)
             self._update_cards(row)
             self._update_diagnosis(row)
@@ -505,7 +518,7 @@ class SlowWatchApp:
             f"{headline}\n\nקטגוריה עם שימוש המעבד הגבוה ביותר: {cpu_cat}.\n"
             f"קטגוריה עם שימוש הזיכרון הגבוה ביותר: {ram_cat}.\n"
             f"זיכרון פנוי: {row['ram_available_mb'] / 1024:.1f} GB • פנוי בכונן המערכת: {row['system_drive_free_pct']:.0f}%\n"
-            "הקטגוריות מצטברות בלבד: שמות תוכנות ותהליכים לא נשמרים."
+            "פירוט תוכנות נשמר בקובץ נפרד אם האפשרות מופעלת; נשמר רק שם קובץ ההפעלה, לא נתיב או שורת פקודה."
         )
 
     def _draw_chart(self) -> None:
@@ -574,10 +587,10 @@ class SlowWatchApp:
 
     def _cleanup_old_data(self) -> None:
         cutoff = dt.date.today() - dt.timedelta(days=RETENTION_DAYS)
-        for prefix in ("metrics", "events"):
+        for prefix in ("metrics", "events", "processes", "browser_samples"):
             for path in self.base_dir.glob(f"{prefix}_????-??-??.csv"):
                 try:
-                    key = path.stem.split("_", 1)[1]
+                    key = path.stem[len(prefix) + 1:]
                     if dt.date.fromisoformat(key) < cutoff:
                         path.unlink(missing_ok=True)
                 except (ValueError, OSError):
@@ -588,7 +601,7 @@ class SlowWatchApp:
         paths = []
         for path in self.base_dir.glob(f"{prefix}_????-??-??.csv"):
             try:
-                key = dt.date.fromisoformat(path.stem.split("_", 1)[1])
+                key = dt.date.fromisoformat(path.stem[len(prefix) + 1:])
                 if start <= key <= dt.date.today():
                     paths.append(path)
             except ValueError:
@@ -608,7 +621,7 @@ class SlowWatchApp:
             "processor_model": platform.processor() or "not reported",
             "collection_interval_seconds": self.sample_interval.get(),
             "report_period_days": EXPORT_DAYS,
-            "privacy_note": "No hostname, username, IP/MAC address, process name/PID, paths, window titles, browser history, keystrokes, or file contents are included.",
+            "privacy_note": "No hostname, username, IP/MAC address, PID, command line, filesystem paths, full URLs, page titles, email subjects/content, keystrokes, or file contents are included. Heavy executable basenames, site domains, and Gmail thread IDs may be included.",
         }
         try:
             drive = os.environ.get("SystemDrive", "C:")
@@ -673,10 +686,49 @@ class SlowWatchApp:
                 )
         else:
             lines.append("לא נרשמו אירועים.")
+        processes = read_csv_rows(self._paths_for_days("processes", EXPORT_DAYS))
+        browser_samples = read_csv_rows(self._paths_for_days("browser_samples", EXPORT_DAYS))
+        lines += ["", "תוכנות שצרכו הכי הרבה משאבים:"]
+        proc_groups: dict[str, dict[str, float]] = {}
+        for row in processes:
+            name = row.get("program", "unknown-program")
+            group = proc_groups.setdefault(name, {"cpu": 0, "ram": 0, "read": 0, "write": 0})
+            try:
+                group["cpu"] = max(group["cpu"], float(row.get("cpu_pct") or 0))
+                group["ram"] = max(group["ram"], float(row.get("ram_mb") or 0))
+                group["read"] = max(group["read"], float(row.get("read_mb_s") or 0))
+                group["write"] = max(group["write"], float(row.get("write_mb_s") or 0))
+            except (TypeError, ValueError):
+                pass
+        if proc_groups:
+            ranked = sorted(proc_groups.items(), key=lambda item: max(item[1]["cpu"], item[1]["ram"] / 16, item[1]["read"] * 10, item[1]["write"] * 10), reverse=True)
+            for name, vals in ranked[:25]:
+                lines.append(f"- {name}: CPU max {vals['cpu']:.1f}% | RAM max {vals['ram']:.0f}MB | read max {vals['read']:.2f}MB/s | write max {vals['write']:.2f}MB/s")
+        else:
+            lines.append("אין נתוני תוכנות מפורטים; הפעל את האפשרות לאיסוף תוכנות בזמן איסוף המדדים.")
+
+        lines += ["", "לשוניות דפדפן עם אינדיקציות עומס גבוהות (לא מדידת CPU מדויקת לכל לשונית):"]
+        browser_groups: dict[tuple[str, str], dict[str, float]] = {}
+        for row in browser_samples:
+            key = (row.get("site_label", "unknown"), row.get("mail_thread_id", ""))
+            group = browser_groups.setdefault(key, {"count": 0, "long": 0, "heap": 0, "dom": 0, "transfer": 0})
+            try:
+                group["count"] += 1
+                group["long"] = max(group["long"], float(row.get("long_task_ms") or 0))
+                group["heap"] = max(group["heap"], float(row.get("js_heap_mb") or 0))
+                group["dom"] = max(group["dom"], float(row.get("dom_nodes") or 0))
+                group["transfer"] = max(group["transfer"], float(row.get("transfer_kb") or 0))
+            except (TypeError, ValueError):
+                pass
+        if browser_groups:
+            ranked_browser = sorted(browser_groups.items(), key=lambda item: (item[1]["long"], item[1]["heap"], item[1]["dom"]), reverse=True)
+            for (site, thread_id), vals in ranked_browser[:30]:
+                ident = f" | Gmail thread ID: {thread_id}" if thread_id else ""
+                lines.append(f"- {site}{ident}: samples {int(vals['count'])} | long task max {vals['long']:.0f}ms | JS heap max {vals['heap']:.1f}MB | resources {vals['transfer']:.0f}KB | DOM {vals['dom']:.0f}")
+        else:
+            lines.append("לא יובאו מדידות דפדפן; ייצא JSON מההרחבה וייבא דרך התוכנה.")
+
         lines += [
-            "",
-            "קטגוריות תהליכים:",
-            "בקובץ המדדים מופיעים רק סכומים לפי קטגוריות כלליות (למשל דפדפנים או אבטחה). שמות תוכנות, מזהי תהליך ונתיבי קבצים אינם נשמרים.",
             "",
             "איך לפרש:",
             "1. השווה את השעות שסומנו USER_MARKED_SLOW עם המדדים באותה שעה.",
@@ -689,6 +741,44 @@ class SlowWatchApp:
             "פרטיות: הדוח נוצר לבקשת המשתמש. התוכנה אינה שולחת אותו ל-AI או לרשת; יש לצרף אותו ידנית לשירות AI לפי בחירתך.",
         ]
         return "\n".join(lines)
+
+    def import_browser_data(self) -> None:
+        path = filedialog.askopenfilename(title="ייבוא קובץ מדידות מהרחבת הדפדפן", filetypes=(("JSON", "*.json"), ("כל הקבצים", "*.*")))
+        if not path:
+            return
+        try:
+            if os.path.getsize(path) > 30 * 1024 * 1024:
+                raise ValueError("הקובץ גדול מדי (מעל 30MB).")
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if not isinstance(payload, dict) or payload.get("schema") != "pcslowwatch-browser-v1":
+                raise ValueError("זה לא קובץ ייצוא מוכר של PC Slow Watch Browser Monitor.")
+            samples = payload.get("samples")
+            if not isinstance(samples, list):
+                raise ValueError("הקובץ אינו מכיל רשימת דגימות תקינה.")
+            existing_ids: set[str] = set()
+            for pth in self._paths_for_days("browser_samples", RETENTION_DAYS):
+                for old in read_csv_rows([pth]):
+                    if old.get("sample_id"):
+                        existing_ids.add(old["sample_id"])
+            imported = skipped = duplicates = 0
+            for raw in samples[-25000:]:
+                row = sanitize_browser_sample(raw)
+                if row is None:
+                    skipped += 1
+                    continue
+                sample_id = row.get("sample_id", "")
+                if sample_id and sample_id in existing_ids:
+                    duplicates += 1
+                    continue
+                day = dt.datetime.fromisoformat(row["timestamp"]).date().isoformat()
+                self._append_row(self._path("browser_samples", day), BROWSER_FIELDS, row)
+                if sample_id:
+                    existing_ids.add(sample_id)
+                imported += 1
+            messagebox.showinfo("ייבוא מדידות דפדפן", f"נוספו {imported} דגימות; דולגו {duplicates} כפילויות ו-{skipped} רשומות לא תקינות. נשמרים דומיין, מזהה Gmail ומדדי ביצועים בלבד.")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            messagebox.showerror("הייבוא נכשל", f"לא ניתן לייבא את הקובץ.\n{exc}")
 
     def export_report(self) -> None:
         path_str = filedialog.asksaveasfilename(
@@ -703,6 +793,10 @@ class SlowWatchApp:
         event_paths = self._paths_for_days("events", EXPORT_DAYS)
         metric_rows = read_csv_rows(metric_paths)
         event_rows = read_csv_rows(event_paths)
+        process_paths = self._paths_for_days("processes", EXPORT_DAYS)
+        browser_paths = self._paths_for_days("browser_samples", EXPORT_DAYS)
+        process_rows = read_csv_rows(process_paths)
+        browser_rows = read_csv_rows(browser_paths)
         metric_rows.sort(key=lambda r: r.get("timestamp", ""))
         event_rows.sort(key=lambda r: r.get("timestamp", ""))
         system_info = self._system_info()
@@ -710,8 +804,8 @@ class SlowWatchApp:
         privacy = (
             "חבילת ייצוא פרטיות — PC Slow Watch\n\n"
             "מה כלול: מדדי ביצועים מצטברים, אירועי עומס וסיכום חומרה/מערכת כללי.\n"
-            "מה לא כלול: שם משתמש, שם מחשב, כתובת IP/MAC, שמות תהליכים ותוכנות ספציפיים, מזהי תהליך, שורת פקודה, נתיבי קבצים, תוכן קבצים, כותרות חלונות, הקלדות, היסטוריית גלישה או צילומי מסך.\n"
-            "הקטגוריה של שימוש בתהליכים מחושבת בזיכרון ונשמרת רק כסכום קטגוריה.\n"
+            "מה לא כלול: שם משתמש/מחשב, IP/MAC, PID, שורת פקודה, נתיבים, URL מלא, כותרות עמוד, תוכן עמוד או מייל, פרטי חשבון, הקלדות או צילומי מסך.\n"
+            "כן כלולים שמות קובצי הפעלה של תוכנות כבדות, דומיין/קטגוריית אתר, ומזהה Gmail בלבד כשזמין.\n"
             "לא מתבצעת שליחה אוטומטית. ה-ZIP נוצר רק לאחר לחיצה על 'הכן דוח ל-AI'.\n"
             "בדוק את תוכן החבילה לפני העלאה לשירות חיצוני.\n"
         )
@@ -722,7 +816,9 @@ class SlowWatchApp:
                 archive.writestr("system_info.json", json.dumps(system_info, ensure_ascii=False, indent=2))
                 archive.writestr("metrics.csv", self._csv_text(METRIC_FIELDS, metric_rows))
                 archive.writestr("events.csv", self._csv_text(EVENT_FIELDS, event_rows))
-            messagebox.showinfo("הדוח מוכן", f"נוצרה חבילת ניתוח מקומית:\n{path_str}\n\nדגימות: {len(metric_rows)} | אירועים: {len(event_rows)}\n\nלא נשלח מידע אוטומטית.")
+                archive.writestr("processes.csv", self._csv_text(PROCESS_FIELDS, process_rows))
+                archive.writestr("browser_samples.csv", self._csv_text(BROWSER_FIELDS, browser_rows))
+            messagebox.showinfo("הדוח מוכן", f"נוצרה חבילת ניתוח מקומית:\n{path_str}\n\nדגימות מערכת: {len(metric_rows)} | תוכנות: {len(process_rows)} | דפדפן: {len(browser_rows)} | אירועים: {len(event_rows)}\n\nלא נשלח מידע אוטומטית.")
         except (OSError, zipfile.BadZipFile) as exc:
             messagebox.showerror("שגיאה בייצוא", f"לא ניתן ליצור את הדוח ({type(exc).__name__}).")
 
