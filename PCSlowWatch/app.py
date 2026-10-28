@@ -23,8 +23,12 @@ except ImportError:
     psutil = None
 
 APP_NAME = "PC Slow Watch"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 SAMPLE_INTERVAL_DEFAULT = 5
+PROCESS_LOG_INTERVAL_SECONDS = 30
+HIGH_LOAD_PROCESS_LOG_INTERVAL_SECONDS = 15
+MAX_PROCESS_ROWS = 15
+CLEANUP_INTERVAL_SECONDS = 900
 RETENTION_DAYS = 30
 EXPORT_DAYS = 7
 ALERT_COOLDOWN_SECONDS = 60
@@ -249,7 +253,7 @@ class Collector:
             {"program": r["program"], "category": r["category"], "cpu_pct": round(r["cpu_pct"], 2),
              "ram_mb": round(r["ram_mb"], 1), "read_mb_s": round(r["read_mb_s"], 3),
              "write_mb_s": round(r["write_mb_s"], 3), "threads": r["threads"], "instances": r["instances"]}
-            for r in rows[:50]
+            for r in rows[:MAX_PROCESS_ROWS]
         ]
         return {c: (round(cat_cpu[c], 1), round(cat_ram[c], 1)) for c in CATEGORIES}
 
@@ -320,10 +324,13 @@ class SlowWatchApp:
         self.current: dict[str, Any] = {}
         self.history: deque[dict[str, Any]] = deque(maxlen=HISTORY_POINTS)
         self.recent_events: deque[str] = deque(maxlen=9)
+        self.last_process_log_at = 0.0
+        self.last_cleanup_at = time.monotonic()
         self.sample_interval = tk.IntVar(value=SAMPLE_INTERVAL_DEFAULT)
         self.detailed_process_var = tk.BooleanVar(value=True)
         self._build_ui()
         self._cleanup_old_data()
+        self.last_cleanup_at = time.monotonic()
         self._set_status("מוכן. האיסוף יתחיל רק לאחר לחיצה על 'התחל איסוף'.")
         if psutil is None:
             self.start_button.configure(state="disabled")
@@ -354,7 +361,7 @@ class SlowWatchApp:
         extras = tk.Frame(self.root, bg="#f3f5f8", padx=18, pady=(0, 8))
         extras.pack(fill="x")
         ttk.Checkbutton(
-            extras, text="איסוף מפורט של תוכנות ותהליכים (ברירת מחדל פעיל)",
+            extras, text="שמירת פירוט תוכנות ותהליכים (ברירת מחדל פעיל)",
             variable=self.detailed_process_var
         ).pack(side="left")
         ttk.Button(extras, text="ייבא מדידות דפדפן", command=self.import_browser_data).pack(side="right")
@@ -407,13 +414,19 @@ class SlowWatchApp:
         return self.base_dir / f"{prefix}_{date_key or today_key()}.csv"
 
     def _append_row(self, path: Path, fields: list[str], row: dict[str, Any]) -> None:
-        exists = path.exists()
+        self._append_rows(path, fields, [row])
+
+    def _append_rows(self, path: Path, fields: list[str], rows: list[dict[str, Any]]) -> None:
+        """Append a batch in one file operation to avoid repeated disk opens."""
+        if not rows:
+            return
         try:
+            exists = path.exists() and path.stat().st_size > 0
             with path.open("a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
                 if not exists:
                     writer.writeheader()
-                writer.writerow({field: row.get(field, "") for field in fields})
+                writer.writerows({field: row.get(field, "") for field in fields} for row in rows)
         except OSError as exc:
             self._set_status(f"שגיאה בשמירה המקומית: {type(exc).__name__}. בדוק הרשאות ותיקיית נתונים.")
 
@@ -476,11 +489,30 @@ class SlowWatchApp:
             row = self.collector.sample()
             self.current = row
             self._append_row(self._path("metrics"), METRIC_FIELDS, row)
-            if self.detailed_process_var.get() and self.collector is not None:
-                for process_row in self.collector.last_process_rows:
-                    safe_row = dict(process_row)
-                    safe_row["timestamp"] = row["timestamp"]
-                    self._append_row(self._path("processes"), PROCESS_FIELDS, safe_row)
+            now_monotonic = time.monotonic()
+            high_load = (
+                row["cpu_pct"] >= 85
+                or row["ram_pct"] >= 90
+                or row["swap_pct"] >= 70
+                or row["disk_busy_pct_est"] >= 90
+            )
+            process_interval = (
+                HIGH_LOAD_PROCESS_LOG_INTERVAL_SECONDS
+                if high_load else PROCESS_LOG_INTERVAL_SECONDS
+            )
+            if (
+                self.detailed_process_var.get()
+                and self.collector is not None
+                and (
+                    self.last_process_log_at <= 0
+                    or now_monotonic - self.last_process_log_at >= process_interval
+                )
+            ):
+                self._save_process_snapshot(row["timestamp"])
+                self.last_process_log_at = now_monotonic
+            if now_monotonic - self.last_cleanup_at >= CLEANUP_INTERVAL_SECONDS:
+                self._cleanup_old_data()
+                self.last_cleanup_at = now_monotonic
             self.history.append(row)
             self._update_cards(row)
             self._update_diagnosis(row)
@@ -578,13 +610,28 @@ class SlowWatchApp:
                 self.last_alert[kind] = now
                 self._append_event(kind, detail, row)
 
+    def _save_process_snapshot(self, timestamp: str | None = None) -> None:
+        """Store a compact process snapshot at the regular cadence or at a slowdown mark."""
+        if not self.detailed_process_var.get() or self.collector is None:
+            return
+        stamp = timestamp or dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        rows = []
+        for process_row in self.collector.last_process_rows:
+            saved = dict(process_row)
+            saved["timestamp"] = stamp
+            rows.append(saved)
+        self._append_rows(self._path("processes"), PROCESS_FIELDS, rows)
+
     def mark_slow(self) -> None:
         if not self.current:
             self._append_event("USER_MARKED_SLOW", "המשתמש סימן שהמחשב איטי; עדיין לא נאספה דגימה.", {})
             self._set_status("נשמר סימון ידני. התחל איסוף כדי לצרף אליו מדדים.")
         else:
+            mark_timestamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
             self._append_event("USER_MARKED_SLOW", "המשתמש סימן שהמחשב איטי עכשיו.", self.current)
-            self._set_status("נשמר סימון של רגע האיטיות לצד המדדים שנמדדו.")
+            self._save_process_snapshot(mark_timestamp)
+            self.last_process_log_at = time.monotonic()
+            self._set_status("נשמר סימון של רגע האיטיות לצד המדדים ודגימת התוכנות באותו זמן.")
 
     def _cleanup_old_data(self) -> None:
         cutoff = dt.date.today() - dt.timedelta(days=RETENTION_DAYS)
