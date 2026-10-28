@@ -6,6 +6,7 @@
   const tabRef = crypto.randomUUID();
   let longTaskCount = 0, longTaskMs = 0;
   let resourceEntriesSeen = 0, transferBytesTotal = 0;
+  let cachedDomNodes = 0, lastDomCountAt = 0;
 
   try {
     if ("PerformanceObserver" in window) {
@@ -72,13 +73,19 @@
         }
         resourceEntriesSeen = resources.length;
         const nav = performance.getEntriesByType("navigation")[0], mem = performance.memory;
+        const now = Date.now();
+        // Count the DOM less frequently: a very large page can make this traversal expensive.
+        if (!lastDomCountAt || now - lastDomCountAt >= 30000) {
+          cachedDomNodes = document.getElementsByTagName("*").length;
+          lastDomCountAt = now;
+        }
         const sample = {
           tab_ref: tabRef, site_label: siteLabel(host), site_category: categoryFor(host), mail_thread_id: gmailThreadId(host),
           visible: document.visibilityState === "visible", resource_count: resources.length,
           transfer_kb: Math.round((transferBytesTotal / 1024) * 100) / 100,
           long_task_count: longTaskCount, long_task_ms: Math.round(longTaskMs * 100) / 100,
           js_heap_mb: mem && Number.isFinite(mem.usedJSHeapSize) ? Math.round((mem.usedJSHeapSize / (1024 * 1024)) * 100) / 100 : 0,
-          dom_nodes: document.getElementsByTagName("*").length,
+          dom_nodes: cachedDomNodes,
           load_ms: nav ? Math.max(0, Number(nav.loadEventEnd || nav.domContentLoadedEventEnd || 0) - Number(nav.startTime || 0)) : 0
         };
         longTaskCount = 0; longTaskMs = 0;
