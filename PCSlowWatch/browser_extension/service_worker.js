@@ -46,12 +46,13 @@ async function initializeStorage() {
     await chrome.storage.local.set({ [ENABLED_KEY]: true });
   }
 
-  // Migrate the prior single-array format without losing original timestamps.
+  // Migrate the prior single-array format without duplicating a near-quota store.
   const legacy = state[LEGACY_SAMPLES_KEY];
   if (Array.isArray(legacy)) {
+    const legacyRows = legacy.slice(-MAX_SAMPLES);
     const cutoff = Date.now() - RETENTION_MS;
     const groups = {};
-    for (const input of legacy.slice(-MAX_SAMPLES)) {
+    for (const input of legacyRows) {
       const timestamp = Date.parse(input && input.timestamp);
       if (!Number.isFinite(timestamp) || timestamp < cutoff) continue;
       const sample = sanitizeSample(input, timestamp, true);
@@ -60,9 +61,23 @@ async function initializeStorage() {
       if (!groups[key]) groups[key] = [];
       groups[key].push(sample);
     }
-    if (Object.keys(groups).length) await chrome.storage.local.set(groups);
+
+    // Free the old array before writing its bucketed replacement, otherwise
+    // the temporary duplicate could exceed chrome.storage.local's quota.
     await chrome.storage.local.remove(LEGACY_SAMPLES_KEY);
-    await pruneSamples();
+    try {
+      if (Object.keys(groups).length) await chrome.storage.local.set(groups);
+      await pruneSamples();
+    } catch (_error) {
+      // Keep the most recent portion if migration cannot fit; the extension can
+      // still collect new samples, and a later startup may migrate this smaller set.
+      const current = await chrome.storage.local.get(null);
+      const partialKeys = Object.keys(groups).filter(key => Array.isArray(current[key]));
+      if (partialKeys.length) await chrome.storage.local.remove(partialKeys);
+      await chrome.storage.local.set({
+        [LEGACY_SAMPLES_KEY]: legacyRows.slice(-5000)
+      });
+    }
   }
 }
 
