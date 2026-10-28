@@ -642,9 +642,12 @@ class SlowWatchApp:
         else:
             mark_timestamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
             self._append_event("USER_MARKED_SLOW", "המשתמש סימן שהמחשב איטי עכשיו.", self.current)
-            self._save_process_snapshot(mark_timestamp)
-            self.last_process_log_at = time.monotonic()
-            self._set_status("נשמר סימון של רגע האיטיות לצד המדדים ודגימת התוכנות באותו זמן.")
+            if self.detailed_process_var.get() and self.collector is not None:
+                self._save_process_snapshot(mark_timestamp)
+                self.last_process_log_at = time.monotonic()
+                self._set_status("נשמר סימון של רגע האיטיות לצד המדדים ודגימת התוכנות באותו זמן.")
+            else:
+                self._set_status("נשמר סימון של רגע האיטיות לצד מדדי המערכת. שמירת פירוט התוכנות כבויה.")
 
     def _cleanup_old_data(self) -> None:
         cutoff = dt.date.today() - dt.timedelta(days=RETENTION_DAYS)
