@@ -30,6 +30,8 @@ HIGH_LOAD_PROCESS_LOG_INTERVAL_SECONDS = 15
 MAX_PROCESS_ROWS = 15
 CLEANUP_INTERVAL_SECONDS = 900
 RETENTION_DAYS = 30
+PROCESS_RETENTION_DAYS = 7
+BROWSER_RETENTION_DAYS = 7
 EXPORT_DAYS = 7
 ALERT_COOLDOWN_SECONDS = 60
 HISTORY_POINTS = 90
@@ -650,8 +652,15 @@ class SlowWatchApp:
                 self._set_status("נשמר סימון של רגע האיטיות לצד מדדי המערכת. שמירת פירוט התוכנות כבויה.")
 
     def _cleanup_old_data(self) -> None:
-        cutoff = dt.date.today() - dt.timedelta(days=RETENTION_DAYS)
-        for prefix in ("metrics", "events", "processes", "browser_samples"):
+        retention_by_prefix = {
+            "metrics": RETENTION_DAYS,
+            "events": RETENTION_DAYS,
+            "processes": PROCESS_RETENTION_DAYS,
+            "browser_samples": BROWSER_RETENTION_DAYS,
+        }
+        today = dt.date.today()
+        for prefix, retention_days in retention_by_prefix.items():
+            cutoff = today - dt.timedelta(days=retention_days)
             for path in self.base_dir.glob(f"{prefix}_????-??-??.csv"):
                 try:
                     key = path.stem[len(prefix) + 1:]
