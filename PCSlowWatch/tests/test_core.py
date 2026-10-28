@@ -1,4 +1,6 @@
+import csv
 import datetime as dt
+import tempfile
 import importlib.util
 import sys
 import unittest
@@ -80,6 +82,31 @@ class PrivacyCategoryTests(unittest.TestCase):
         raw = {"timestamp": dt.datetime.now().astimezone().isoformat(), "site_label": "example.com", "site_category": ["email"]}
         self.assertEqual(module.sanitize_browser_sample(raw)["site_category"], "other")
 
+
+
+class PersistenceAndSamplingTests(unittest.TestCase):
+    def test_process_logging_limits_are_bounded(self):
+        self.assertEqual(module.MAX_PROCESS_ROWS, 15)
+        self.assertGreater(module.PROCESS_LOG_INTERVAL_SECONDS, module.SAMPLE_INTERVAL_DEFAULT)
+        self.assertLess(module.HIGH_LOAD_PROCESS_LOG_INTERVAL_SECONDS, module.PROCESS_LOG_INTERVAL_SECONDS)
+
+    def test_append_rows_writes_one_header_and_appends_batches(self):
+        app = object.__new__(module.SlowWatchApp)
+        fields = ["timestamp", "program"]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "processes.csv"
+            app._append_rows(path, fields, [
+                {"timestamp": "2026-10-28T10:00:00+02:00", "program": "chrome.exe"},
+                {"timestamp": "2026-10-28T10:00:30+02:00", "program": "render.exe"},
+            ])
+            app._append_rows(path, fields, [
+                {"timestamp": "2026-10-28T10:01:00+02:00", "program": "chrome.exe"},
+            ])
+            with path.open("r", newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle))
+            self.assertEqual(rows[0], fields)
+            self.assertEqual(len(rows), 4)
+            self.assertEqual([row[1] for row in rows[1:]], ["chrome.exe", "render.exe", "chrome.exe"])
 
 if __name__ == "__main__":
     unittest.main()
