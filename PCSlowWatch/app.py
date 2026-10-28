@@ -126,7 +126,7 @@ def sanitize_browser_sample(sample: Any) -> dict[str, Any] | None:
     if not isinstance(tab_ref, str) or not re.fullmatch(r"[A-Fa-f0-9-]{8,64}", tab_ref):
         tab_ref = ""
     thread_id = sample.get("mail_thread_id", "")
-    if category != "email" or not isinstance(thread_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", thread_id):
+    if site.lower() != "gmail" or category != "email" or not isinstance(thread_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", thread_id):
         thread_id = ""
     def num(key: str, integer: bool = False, maximum: float = 1_000_000) -> int | float:
         try:
@@ -709,9 +709,9 @@ class SlowWatchApp:
             lines.append("אין נתוני תוכנות מפורטים; הפעל את האפשרות לאיסוף תוכנות בזמן איסוף המדדים.")
 
         lines += ["", "לשוניות דפדפן עם אינדיקציות עומס גבוהות (לא מדידת CPU מדויקת לכל לשונית):"]
-        browser_groups: dict[tuple[str, str], dict[str, float]] = {}
+        browser_groups: dict[tuple[str, str, str], dict[str, float]] = {}
         for row in browser_samples:
-            key = (row.get("site_label", "unknown"), row.get("mail_thread_id", ""))
+            key = (row.get("site_label", "unknown"), row.get("mail_thread_id", ""), row.get("tab_ref", ""))
             group = browser_groups.setdefault(key, {"count": 0, "long": 0, "heap": 0, "dom": 0, "transfer": 0})
             try:
                 group["count"] += 1
@@ -723,7 +723,7 @@ class SlowWatchApp:
                 pass
         if browser_groups:
             ranked_browser = sorted(browser_groups.items(), key=lambda item: (item[1]["long"], item[1]["heap"], item[1]["dom"]), reverse=True)
-            for (site, thread_id), vals in ranked_browser[:30]:
+            for (site, thread_id, tab_ref), vals in ranked_browser[:30]:
                 ident = f" | Gmail thread ID: {thread_id}" if thread_id else ""
                 lines.append(f"- {site}{ident}: samples {int(vals['count'])} | long task max {vals['long']:.0f}ms | JS heap max {vals['heap']:.1f}MB | resources {vals['transfer']:.0f}KB | DOM {vals['dom']:.0f}")
         else:
