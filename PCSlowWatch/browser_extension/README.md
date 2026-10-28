@@ -7,7 +7,7 @@
 3. Choose **Load unpacked** and select this `browser_extension` folder.
 4. Reload already-open web tabs so the content script starts on them.
 
-The extension is enabled by default. It stores performance metadata in local extension storage and never transmits it over the network. Export through the extension popup, then use **ייבא מדידות דפדפן** in the desktop app.
+The extension is enabled by default. It stores performance metadata in local extension storage and never transmits it over the network. Samples are stored in separate five-minute buckets instead of rewriting the entire history on every sample; old buckets are pruned after 7 days and at most 20,000 samples are retained. Export through the extension popup, then use **ייבא מדידות דפדפן** in the desktop app.
 
 ## Permission note
 
