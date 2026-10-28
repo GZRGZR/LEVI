@@ -321,6 +321,7 @@ class SlowWatchApp:
         self.history: deque[dict[str, Any]] = deque(maxlen=HISTORY_POINTS)
         self.recent_events: deque[str] = deque(maxlen=9)
         self.sample_interval = tk.IntVar(value=SAMPLE_INTERVAL_DEFAULT)
+        self.detailed_process_var = tk.BooleanVar(value=True)
         self._build_ui()
         self._cleanup_old_data()
         self._set_status("מוכן. האיסוף יתחיל רק לאחר לחיצה על 'התחל איסוף'.")
