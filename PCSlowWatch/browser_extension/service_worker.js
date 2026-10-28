@@ -67,24 +67,23 @@ async function initializeStorage() {
 }
 
 async function storeSample(input) {
-  const state = await chrome.storage.local.get([ENABLED_KEY]);
-  if (state[ENABLED_KEY] === false) return;
-
   const now = Date.now();
   const sample = sanitizeSample(input, now, false);
   if (!sample || !sample.site_label) return;
 
   const key = bucketKey(now);
-  const bucketState = await chrome.storage.local.get([key]);
-  const bucket = Array.isArray(bucketState[key]) ? bucketState[key] : [];
+  const bucketId = Math.floor(now / BUCKET_MS);
+  // Read the current bucket, toggle and cleanup marker in a single storage call.
+  const state = await chrome.storage.local.get([ENABLED_KEY, key, LAST_CLEANUP_KEY]);
+  if (state[ENABLED_KEY] === false) return;
+
+  const bucket = Array.isArray(state[key]) ? state[key] : [];
   bucket.push(sample);
   await chrome.storage.local.set({ [key]: bucket });
 
   writesSinceCleanup += 1;
-  if (
-    writesSinceCleanup >= 200 ||
-    Number(key.slice(SAMPLES_PREFIX.length)) !== await getLastCleanupBucket()
-  ) {
+  const lastCleanupBucket = Number.isFinite(state[LAST_CLEANUP_KEY]) ? state[LAST_CLEANUP_KEY] : -1;
+  if (writesSinceCleanup >= 200 || bucketId !== lastCleanupBucket) {
     await pruneSamples();
     writesSinceCleanup = 0;
   }
@@ -117,11 +116,6 @@ function sanitizeSample(input, timestampValue, preserveTimestamp) {
   };
 }
 
-async function getLastCleanupBucket() {
-  const state = await chrome.storage.local.get([LAST_CLEANUP_KEY]);
-  return Number.isFinite(state[LAST_CLEANUP_KEY]) ? state[LAST_CLEANUP_KEY] : -1;
-}
-
 async function pruneSamples() {
   const state = await chrome.storage.local.get(null);
   const now = Date.now();
@@ -148,11 +142,19 @@ async function pruneSamples() {
     total += entry.rows.length;
   }
 
-  // Remove oldest whole five-minute buckets if the cap is exceeded.
+  // Remove oldest samples if the cap is exceeded. Normally whole old buckets
+  // disappear, but trim a bucket if it alone contains more rows than the excess.
   for (const entry of valid) {
     if (total <= MAX_SAMPLES) break;
-    remove.push(entry.key);
-    total -= entry.rows.length;
+    const excess = total - MAX_SAMPLES;
+    if (entry.rows.length <= excess) {
+      remove.push(entry.key);
+      total -= entry.rows.length;
+    } else {
+      const trimmed = entry.rows.slice(excess);
+      await chrome.storage.local.set({ [entry.key]: trimmed });
+      total -= excess;
+    }
   }
   if (remove.length) await chrome.storage.local.remove(remove);
   await chrome.storage.local.set({
