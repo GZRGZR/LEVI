@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -22,7 +23,7 @@ except ImportError:
     psutil = None
 
 APP_NAME = "PC Slow Watch"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 SAMPLE_INTERVAL_DEFAULT = 5
 RETENTION_DAYS = 30
 EXPORT_DAYS = 7
@@ -56,6 +57,9 @@ EVENT_FIELDS = [
     "disk_read_latency_ms", "disk_write_latency_ms", "network_recv_mb_s",
     "network_sent_mb_s", "top_cpu_category", "top_ram_category",
 ]
+PROCESS_FIELDS = ["timestamp", "program", "category", "cpu_pct", "ram_mb", "read_mb_s", "write_mb_s", "threads", "instances"]
+BROWSER_FIELDS = ["sample_id", "timestamp", "tab_ref", "site_label", "site_category", "mail_thread_id", "visible", "resource_count", "transfer_kb", "long_task_count", "long_task_ms", "js_heap_mb", "dom_nodes", "load_ms"]
+BROWSER_CATEGORIES = {"banking", "email", "shopping", "video", "social", "news", "development", "search", "other"}
 
 
 def data_dir() -> Path:
@@ -88,6 +92,65 @@ def safe_category(process_name: str | None) -> str:
     return "other"
 
 
+def safe_program_name(value: str | None) -> str:
+    """Keep an executable basename only; never persist paths, PID, or command line."""
+    raw = (value or "").replace("\\", "/").split("/")[-1].strip()
+    raw = re.sub(r"[^A-Za-z0-9._() -]", "", raw)[:80]
+    return raw or "unknown-program"
+
+
+def sanitize_browser_sample(sample: Any) -> dict[str, Any] | None:
+    if not isinstance(sample, dict):
+        return None
+    timestamp = sample.get("timestamp")
+    if not isinstance(timestamp, str) or len(timestamp) > 45:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if not parsed.tzinfo:
+        parsed = parsed.astimezone()
+    if parsed > dt.datetime.now().astimezone() + dt.timedelta(days=1):
+        return None
+    site = sample.get("site_label", "")
+    if not isinstance(site, str) or not re.fullmatch(r"[A-Za-z0-9.-]{1,100}", site):
+        return None
+    category = sample.get("site_category", "other")
+    if not isinstance(category, str) or category not in BROWSER_CATEGORIES:
+        category = "other"
+    sample_id = sample.get("sample_id", "")
+    if not isinstance(sample_id, str) or not re.fullmatch(r"[A-Fa-f0-9-]{8,64}", sample_id):
+        sample_id = ""
+    tab_ref = sample.get("tab_ref", "")
+    if not isinstance(tab_ref, str) or not re.fullmatch(r"[A-Fa-f0-9-]{8,64}", tab_ref):
+        tab_ref = ""
+    thread_id = sample.get("mail_thread_id", "")
+    if category != "email" or not isinstance(thread_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", thread_id):
+        thread_id = ""
+    def num(key: str, integer: bool = False, maximum: float = 1_000_000) -> int | float:
+        try:
+            val = float(sample.get(key, 0))
+            if not (val >= 0 and val <= maximum):
+                val = 0
+        except (TypeError, ValueError):
+            val = 0
+        return int(val) if integer else round(val, 2)
+    return {
+        "sample_id": sample_id,
+        "timestamp": parsed.astimezone().isoformat(timespec="seconds"),
+        "tab_ref": tab_ref, "site_label": site.lower(), "site_category": category,
+        "mail_thread_id": thread_id, "visible": sample.get("visible", False) is True,
+        "resource_count": num("resource_count", True, 100_000),
+        "transfer_kb": num("transfer_kb", False, 10_000_000),
+        "long_task_count": num("long_task_count", True, 100_000),
+        "long_task_ms": num("long_task_ms", False, 86_400_000),
+        "js_heap_mb": num("js_heap_mb", False, 100_000),
+        "dom_nodes": num("dom_nodes", True, 10_000_000),
+        "load_ms": num("load_ms", False, 86_400_000),
+    }
+
+
 def pct(value: Any) -> float:
     try:
         return round(float(value), 1)
@@ -107,63 +170,88 @@ def read_csv_rows(paths: list[Path]) -> list[dict[str, str]]:
 
 
 class Collector:
-    """Collect only aggregate performance metrics; no user content or identifiers."""
+    """Sample system and aggregate executable performance without storing PIDs."""
     def __init__(self) -> None:
         if psutil is None:
             raise RuntimeError("חסרה ספריית psutil. התקן לפי README.md")
         self.cpu_count = psutil.cpu_count(logical=True) or 1
-        self.previous_disk: Any = None
-        self.previous_net: Any = None
-        self.previous_proc_cpu: dict[int, tuple[float, str]] = {}
+        self.previous_disk: Any = psutil.disk_io_counters()
+        self.previous_net: Any = psutil.net_io_counters()
         self.previous_time = time.monotonic()
         self.boot_time = psutil.boot_time()
+        self.previous_proc = self._capture_process_baseline()
+        self.last_process_rows: list[dict[str, Any]] = []
         psutil.cpu_percent(interval=None)
-        self.previous_disk = psutil.disk_io_counters()
-        self.previous_net = psutil.net_io_counters()
         self.previous_time = time.monotonic()
-        self.previous_proc_cpu = self._capture_process_baseline()
 
-    def _capture_process_baseline(self) -> dict[int, tuple[float, str]]:
-        result: dict[int, tuple[float, str]] = {}
-        for proc in psutil.process_iter(attrs=["pid", "name", "cpu_times"]):
+    def _capture_process_baseline(self) -> dict[int, dict[str, Any]]:
+        result: dict[int, dict[str, Any]] = {}
+        for proc in psutil.process_iter(attrs=["pid", "name", "cpu_times", "io_counters"]):
             try:
                 info = proc.info
                 times = info.get("cpu_times")
                 if times is None:
                     continue
-                cpu_s = float(times.user + times.system)
-                result[int(info["pid"])] = (cpu_s, safe_category(info.get("name")))
+                io = info.get("io_counters")
+                result[int(info["pid"])] = {
+                    "cpu_s": float(times.user + times.system),
+                    "read_bytes": int(getattr(io, "read_bytes", 0) or 0),
+                    "write_bytes": int(getattr(io, "write_bytes", 0) or 0),
+                }
             except (psutil.Error, AttributeError, TypeError, ValueError, KeyError):
                 continue
         return result
 
-    def _process_category_usage(self, elapsed: float) -> dict[str, tuple[float, float]]:
-        cpu_seconds: dict[str, float] = {c: 0.0 for c in CATEGORIES}
-        ram_mb: dict[str, float] = {c: 0.0 for c in CATEGORIES}
-        current_cpu: dict[int, tuple[float, str]] = {}
-        for proc in psutil.process_iter(attrs=["pid", "name", "cpu_times", "memory_info"]):
+    def _process_usage(self, elapsed: float) -> dict[str, tuple[float, float]]:
+        cat_cpu: dict[str, float] = {c: 0.0 for c in CATEGORIES}
+        cat_ram: dict[str, float] = {c: 0.0 for c in CATEGORIES}
+        current: dict[int, dict[str, Any]] = {}
+        grouped: dict[str, dict[str, Any]] = {}
+        divisor = max(0.25, elapsed) * self.cpu_count
+        for proc in psutil.process_iter(attrs=["pid", "name", "cpu_times", "memory_info", "io_counters", "num_threads"]):
             try:
                 info = proc.info
                 pid = int(info["pid"])
-                times = info.get("cpu_times")
-                category = safe_category(info.get("name"))
-                if times is not None:
-                    cpu_s = float(times.user + times.system)
-                    current_cpu[pid] = (cpu_s, category)
-                    old = self.previous_proc_cpu.get(pid)
-                    if old is not None:
-                        cpu_seconds[category] += max(0.0, cpu_s - old[0])
-                mem = info.get("memory_info")
-                if mem is not None:
-                    ram_mb[category] += float(mem.rss) / (1024 * 1024)
+                program = safe_program_name(info.get("name"))
+                category = safe_category(program)
+                times, io, mem = info.get("cpu_times"), info.get("io_counters"), info.get("memory_info")
+                cpu_s = float(times.user + times.system) if times is not None else 0.0
+                read_bytes = int(getattr(io, "read_bytes", 0) or 0)
+                write_bytes = int(getattr(io, "write_bytes", 0) or 0)
+                old = self.previous_proc.get(pid)
+                cpu_pct = read_mb_s = write_mb_s = 0.0
+                if old:
+                    cpu_pct = max(0.0, cpu_s - old["cpu_s"]) / divisor * 100
+                    read_mb_s = max(0, read_bytes - old["read_bytes"]) / max(0.25, elapsed) / (1024 * 1024)
+                    write_mb_s = max(0, write_bytes - old["write_bytes"]) / max(0.25, elapsed) / (1024 * 1024)
+                ram_mb = float(mem.rss) / (1024 * 1024) if mem else 0.0
+                current[pid] = {"cpu_s": cpu_s, "read_bytes": read_bytes, "write_bytes": write_bytes}
+                cat_cpu[category] += cpu_pct
+                cat_ram[category] += ram_mb
+                row = grouped.setdefault(program, {"program": program, "category": category, "cpu_pct": 0.0, "ram_mb": 0.0, "read_mb_s": 0.0, "write_mb_s": 0.0, "threads": 0, "instances": 0})
+                row["cpu_pct"] += cpu_pct
+                row["ram_mb"] += ram_mb
+                row["read_mb_s"] += read_mb_s
+                row["write_mb_s"] += write_mb_s
+                row["threads"] += int(info.get("num_threads") or 0)
+                row["instances"] += 1
             except (psutil.Error, AttributeError, TypeError, ValueError, KeyError):
                 continue
-        self.previous_proc_cpu = current_cpu
-        out: dict[str, tuple[float, float]] = {}
-        divisor = max(0.25, elapsed) * self.cpu_count
-        for category in CATEGORIES:
-            out[category] = (round(cpu_seconds[category] / divisor * 100, 1), round(ram_mb[category], 1))
-        return out
+        self.previous_proc = current
+        names: set[str] = set()
+        rows = list(grouped.values())
+        for metric in ("cpu_pct", "ram_mb", "read_mb_s", "write_mb_s"):
+            names.update(r["program"] for r in sorted(rows, key=lambda x: x[metric], reverse=True)[:12])
+        names.update(r["program"] for r in rows if r["cpu_pct"] >= 0.5 or r["ram_mb"] >= 75 or r["read_mb_s"] >= 0.25 or r["write_mb_s"] >= 0.25)
+        rows = [r for r in rows if r["program"] in names]
+        rows.sort(key=lambda r: max(r["cpu_pct"], r["ram_mb"] / 16, r["read_mb_s"] * 10, r["write_mb_s"] * 10), reverse=True)
+        self.last_process_rows = [
+            {"program": r["program"], "category": r["category"], "cpu_pct": round(r["cpu_pct"], 2),
+             "ram_mb": round(r["ram_mb"], 1), "read_mb_s": round(r["read_mb_s"], 3),
+             "write_mb_s": round(r["write_mb_s"], 3), "threads": r["threads"], "instances": r["instances"]}
+            for r in rows[:50]
+        ]
+        return {c: (round(cat_cpu[c], 1), round(cat_ram[c], 1)) for c in CATEGORIES}
 
     @staticmethod
     def _disk_usage_pct() -> float:
@@ -175,61 +263,44 @@ class Collector:
             return 0.0
 
     def sample(self) -> dict[str, Any]:
-        now_mono = time.monotonic()
-        elapsed = max(0.25, now_mono - self.previous_time)
-        self.previous_time = now_mono
-        cpu = pct(psutil.cpu_percent(interval=None))
-        vm = psutil.virtual_memory()
-        swap = psutil.swap_memory()
-        disk = psutil.disk_io_counters()
-        net = psutil.net_io_counters()
-
+        now = time.monotonic()
+        elapsed = max(0.25, now - self.previous_time)
+        self.previous_time = now
+        cpu, vm, swap = pct(psutil.cpu_percent(interval=None)), psutil.virtual_memory(), psutil.swap_memory()
+        disk, net = psutil.disk_io_counters(), psutil.net_io_counters()
         read_mb_s = write_mb_s = busy_pct = read_latency = write_latency = 0.0
         if disk is not None and self.previous_disk is not None:
             read_mb_s = max(0.0, disk.read_bytes - self.previous_disk.read_bytes) / elapsed / (1024 * 1024)
             write_mb_s = max(0.0, disk.write_bytes - self.previous_disk.write_bytes) / elapsed / (1024 * 1024)
-            read_ops = max(0, disk.read_count - self.previous_disk.read_count)
-            write_ops = max(0, disk.write_count - self.previous_disk.write_count)
-            read_time_ms = max(0, getattr(disk, "read_time", 0) - getattr(self.previous_disk, "read_time", 0))
-            write_time_ms = max(0, getattr(disk, "write_time", 0) - getattr(self.previous_disk, "write_time", 0))
-            if read_ops:
-                read_latency = read_time_ms / read_ops
-            if write_ops:
-                write_latency = write_time_ms / write_ops
-            busy_pct = min(100.0, (read_time_ms + write_time_ms) / (elapsed * 1000) * 100)
+            r_ops = max(0, disk.read_count - self.previous_disk.read_count)
+            w_ops = max(0, disk.write_count - self.previous_disk.write_count)
+            r_ms = max(0, getattr(disk, "read_time", 0) - getattr(self.previous_disk, "read_time", 0))
+            w_ms = max(0, getattr(disk, "write_time", 0) - getattr(self.previous_disk, "write_time", 0))
+            if r_ops: read_latency = r_ms / r_ops
+            if w_ops: write_latency = w_ms / w_ops
+            busy_pct = min(100.0, (r_ms + w_ms) / (elapsed * 1000) * 100)
         self.previous_disk = disk
-
         recv_mb_s = sent_mb_s = 0.0
         if net is not None and self.previous_net is not None:
             recv_mb_s = max(0.0, net.bytes_recv - self.previous_net.bytes_recv) / elapsed / (1024 * 1024)
             sent_mb_s = max(0.0, net.bytes_sent - self.previous_net.bytes_sent) / elapsed / (1024 * 1024)
         self.previous_net = net
-
-        categories = self._process_category_usage(elapsed)
-        top_cpu = max(categories, key=lambda key: categories[key][0])
-        top_ram = max(categories, key=lambda key: categories[key][1])
+        cats = self._process_usage(elapsed)
+        top_cpu = max(cats, key=lambda k: cats[k][0])
+        top_ram = max(cats, key=lambda k: cats[k][1])
         result: dict[str, Any] = {
             "timestamp": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-            "cpu_pct": round(cpu, 1),
-            "ram_pct": round(vm.percent, 1),
-            "ram_used_mb": round(vm.used / (1024 * 1024), 1),
-            "ram_available_mb": round(vm.available / (1024 * 1024), 1),
-            "swap_pct": round(swap.percent, 1),
-            "disk_read_mb_s": round(read_mb_s, 3),
-            "disk_write_mb_s": round(write_mb_s, 3),
-            "disk_busy_pct_est": round(busy_pct, 1),
-            "disk_read_latency_ms": round(read_latency, 1),
-            "disk_write_latency_ms": round(write_latency, 1),
-            "network_recv_mb_s": round(recv_mb_s, 3),
-            "network_sent_mb_s": round(sent_mb_s, 3),
-            "system_drive_free_pct": self._disk_usage_pct(),
-            "uptime_hours": round(max(0.0, time.time() - self.boot_time) / 3600, 1),
-            "top_cpu_category": top_cpu,
-            "top_ram_category": top_ram,
+            "cpu_pct": round(cpu, 1), "ram_pct": round(vm.percent, 1),
+            "ram_used_mb": round(vm.used / (1024 * 1024), 1), "ram_available_mb": round(vm.available / (1024 * 1024), 1),
+            "swap_pct": round(swap.percent, 1), "disk_read_mb_s": round(read_mb_s, 3), "disk_write_mb_s": round(write_mb_s, 3),
+            "disk_busy_pct_est": round(busy_pct, 1), "disk_read_latency_ms": round(read_latency, 1), "disk_write_latency_ms": round(write_latency, 1),
+            "network_recv_mb_s": round(recv_mb_s, 3), "network_sent_mb_s": round(sent_mb_s, 3),
+            "system_drive_free_pct": self._disk_usage_pct(), "uptime_hours": round(max(0.0, time.time() - self.boot_time) / 3600, 1),
+            "top_cpu_category": top_cpu, "top_ram_category": top_ram,
         }
         for cat in CATEGORIES:
-            result[f"proc_{cat}_cpu_pct"] = categories[cat][0]
-            result[f"proc_{cat}_ram_mb"] = categories[cat][1]
+            result[f"proc_{cat}_cpu_pct"] = cats[cat][0]
+            result[f"proc_{cat}_ram_mb"] = cats[cat][1]
         return result
 
 
