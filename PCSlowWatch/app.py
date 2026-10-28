@@ -185,6 +185,7 @@ class Collector:
         self.boot_time = psutil.boot_time()
         self.previous_proc = self._capture_process_baseline()
         self.last_process_rows: list[dict[str, Any]] = []
+        self.last_detailed_mode: bool | None = None
         psutil.cpu_percent(interval=None)
         self.previous_time = time.monotonic()
 
@@ -206,13 +207,21 @@ class Collector:
                 continue
         return result
 
-    def _process_usage(self, elapsed: float) -> dict[str, tuple[float, float]]:
+    def _process_usage(self, elapsed: float, include_details: bool = True) -> dict[str, tuple[float, float]]:
+        if include_details and self.last_detailed_mode is False:
+            # Refresh I/O counters after detailed logging has been turned back on,
+            # otherwise the first sample could report an artificial I/O spike.
+            self.previous_proc = self._capture_process_baseline()
+        self.last_detailed_mode = include_details
         cat_cpu: dict[str, float] = {c: 0.0 for c in CATEGORIES}
         cat_ram: dict[str, float] = {c: 0.0 for c in CATEGORIES}
         current: dict[int, dict[str, Any]] = {}
         grouped: dict[str, dict[str, Any]] = {}
         divisor = max(0.25, elapsed) * self.cpu_count
-        for proc in psutil.process_iter(attrs=["pid", "name", "cpu_times", "memory_info", "io_counters", "num_threads"]):
+        attrs = ["pid", "name", "cpu_times", "memory_info"]
+        if include_details:
+            attrs.extend(["io_counters", "num_threads"])
+        for proc in psutil.process_iter(attrs=attrs):
             try:
                 info = proc.info
                 pid = int(info["pid"])
@@ -232,29 +241,33 @@ class Collector:
                 current[pid] = {"cpu_s": cpu_s, "read_bytes": read_bytes, "write_bytes": write_bytes}
                 cat_cpu[category] += cpu_pct
                 cat_ram[category] += ram_mb
-                row = grouped.setdefault(program, {"program": program, "category": category, "cpu_pct": 0.0, "ram_mb": 0.0, "read_mb_s": 0.0, "write_mb_s": 0.0, "threads": 0, "instances": 0})
-                row["cpu_pct"] += cpu_pct
-                row["ram_mb"] += ram_mb
-                row["read_mb_s"] += read_mb_s
-                row["write_mb_s"] += write_mb_s
-                row["threads"] += int(info.get("num_threads") or 0)
-                row["instances"] += 1
+                if include_details:
+                    row = grouped.setdefault(program, {"program": program, "category": category, "cpu_pct": 0.0, "ram_mb": 0.0, "read_mb_s": 0.0, "write_mb_s": 0.0, "threads": 0, "instances": 0})
+                    row["cpu_pct"] += cpu_pct
+                    row["ram_mb"] += ram_mb
+                    row["read_mb_s"] += read_mb_s
+                    row["write_mb_s"] += write_mb_s
+                    row["threads"] += int(info.get("num_threads") or 0)
+                    row["instances"] += 1
             except (psutil.Error, AttributeError, TypeError, ValueError, KeyError):
                 continue
         self.previous_proc = current
-        names: set[str] = set()
-        rows = list(grouped.values())
-        for metric in ("cpu_pct", "ram_mb", "read_mb_s", "write_mb_s"):
-            names.update(r["program"] for r in sorted(rows, key=lambda x: x[metric], reverse=True)[:12])
-        names.update(r["program"] for r in rows if r["cpu_pct"] >= 0.5 or r["ram_mb"] >= 75 or r["read_mb_s"] >= 0.25 or r["write_mb_s"] >= 0.25)
-        rows = [r for r in rows if r["program"] in names]
-        rows.sort(key=lambda r: max(r["cpu_pct"], r["ram_mb"] / 16, r["read_mb_s"] * 10, r["write_mb_s"] * 10), reverse=True)
-        self.last_process_rows = [
-            {"program": r["program"], "category": r["category"], "cpu_pct": round(r["cpu_pct"], 2),
-             "ram_mb": round(r["ram_mb"], 1), "read_mb_s": round(r["read_mb_s"], 3),
-             "write_mb_s": round(r["write_mb_s"], 3), "threads": r["threads"], "instances": r["instances"]}
-            for r in rows[:MAX_PROCESS_ROWS]
-        ]
+        if include_details:
+            names: set[str] = set()
+            rows = list(grouped.values())
+            for metric in ("cpu_pct", "ram_mb", "read_mb_s", "write_mb_s"):
+                names.update(r["program"] for r in sorted(rows, key=lambda x: x[metric], reverse=True)[:12])
+            names.update(r["program"] for r in rows if r["cpu_pct"] >= 0.5 or r["ram_mb"] >= 75 or r["read_mb_s"] >= 0.25 or r["write_mb_s"] >= 0.25)
+            rows = [r for r in rows if r["program"] in names]
+            rows.sort(key=lambda r: max(r["cpu_pct"], r["ram_mb"] / 16, r["read_mb_s"] * 10, r["write_mb_s"] * 10), reverse=True)
+            self.last_process_rows = [
+                {"program": r["program"], "category": r["category"], "cpu_pct": round(r["cpu_pct"], 2),
+                 "ram_mb": round(r["ram_mb"], 1), "read_mb_s": round(r["read_mb_s"], 3),
+                 "write_mb_s": round(r["write_mb_s"], 3), "threads": r["threads"], "instances": r["instances"]}
+                for r in rows[:MAX_PROCESS_ROWS]
+            ]
+        else:
+            self.last_process_rows = []
         return {c: (round(cat_cpu[c], 1), round(cat_ram[c], 1)) for c in CATEGORIES}
 
     @staticmethod
@@ -266,7 +279,7 @@ class Collector:
         except (OSError, AttributeError):
             return 0.0
 
-    def sample(self) -> dict[str, Any]:
+    def sample(self, detailed_processes: bool = True) -> dict[str, Any]:
         now = time.monotonic()
         elapsed = max(0.25, now - self.previous_time)
         self.previous_time = now
@@ -289,7 +302,7 @@ class Collector:
             recv_mb_s = max(0.0, net.bytes_recv - self.previous_net.bytes_recv) / elapsed / (1024 * 1024)
             sent_mb_s = max(0.0, net.bytes_sent - self.previous_net.bytes_sent) / elapsed / (1024 * 1024)
         self.previous_net = net
-        cats = self._process_usage(elapsed)
+        cats = self._process_usage(elapsed, include_details=detailed_processes)
         top_cpu = max(cats, key=lambda k: cats[k][0])
         top_ram = max(cats, key=lambda k: cats[k][1])
         result: dict[str, Any] = {
@@ -486,7 +499,7 @@ class SlowWatchApp:
         if not self.running or self.collector is None:
             return
         try:
-            row = self.collector.sample()
+            row = self.collector.sample(detailed_processes=self.detailed_process_var.get())
             self.current = row
             self._append_row(self._path("metrics"), METRIC_FIELDS, row)
             now_monotonic = time.monotonic()
