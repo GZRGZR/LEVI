@@ -1,0 +1,47 @@
+name: PC Slow Watch tests
+
+on:
+  push:
+    branches:
+      - main
+      - fix/pcslowwatch-diagnostics
+    paths:
+      - "PCSlowWatch/**"
+      - ".github/workflows/pcslowwatch-tests.yml"
+  pull_request:
+    paths:
+      - "PCSlowWatch/**"
+      - ".github/workflows/pcslowwatch-tests.yml"
+
+jobs:
+  python-tests:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -r PCSlowWatch/requirements.txt
+      - name: Compile Python source
+        run: python -m py_compile PCSlowWatch/app.py
+      - name: Run unit tests
+        run: python -m unittest discover -s PCSlowWatch/tests -v
+
+  extension-syntax:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Check browser extension JavaScript syntax
+        shell: pwsh
+        run: |
+          node --check PCSlowWatch/browser_extension/content.js
+          node --check PCSlowWatch/browser_extension/service_worker.js
+          node --check PCSlowWatch/browser_extension/popup.js
