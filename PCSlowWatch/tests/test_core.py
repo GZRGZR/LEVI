@@ -63,6 +63,15 @@ class PrivacyCategoryTests(unittest.TestCase):
         self.assertNotIn("username", clean)
         self.assertEqual(set(clean), set(module.BROWSER_FIELDS))
 
+    def test_only_gmail_thread_ids_are_preserved(self):
+        raw = {
+            "timestamp": dt.datetime.now().astimezone().isoformat(),
+            "site_label": "outlook",
+            "site_category": "email",
+            "mail_thread_id": "opaque-thread-key-1234",
+        }
+        self.assertEqual(module.sanitize_browser_sample(raw)["mail_thread_id"], "")
+
     def test_browser_import_rejects_full_urls_as_site_label(self):
         raw = {"timestamp": dt.datetime.now().astimezone().isoformat(), "site_label": "mybank.com/account/123", "site_category": "banking"}
         self.assertIsNone(module.sanitize_browser_sample(raw))
