@@ -176,7 +176,7 @@ def read_csv_rows(paths: list[Path]) -> list[dict[str, str]]:
 
 
 class Collector:
-    """Sample system and aggregate executable performance without storing PIDs."""
+    """Collect fast system/CPU/RAM metrics often; query process I/O and threads only on snapshots."""
     def __init__(self) -> None:
         if psutil is None:
             raise RuntimeError("חסרה ספריית psutil. התקן לפי README.md")
@@ -185,7 +185,12 @@ class Collector:
         self.previous_net: Any = psutil.net_io_counters()
         self.previous_time = time.monotonic()
         self.boot_time = psutil.boot_time()
+        # The fast sampling path reads only basic CPU times and RAM information.
         self.previous_proc = self._capture_process_baseline()
+        # I/O counters and thread counts are queried only when a detailed snapshot is due.
+        self.previous_detailed_io: dict[int, dict[str, Any]] = {}
+        self.previous_detailed_at: float | None = None
+        self.pending_process_peaks: dict[str, dict[str, Any]] = {}
         self.last_process_rows: list[dict[str, Any]] = []
         self.last_detailed_mode: bool | None = None
         psutil.cpu_percent(interval=None)
@@ -193,84 +198,155 @@ class Collector:
 
     def _capture_process_baseline(self) -> dict[int, dict[str, Any]]:
         result: dict[int, dict[str, Any]] = {}
-        for proc in psutil.process_iter(attrs=["pid", "name", "cpu_times", "io_counters"]):
+        for proc in psutil.process_iter(attrs=["pid", "name", "cpu_times"]):
             try:
                 info = proc.info
                 times = info.get("cpu_times")
                 if times is None:
                     continue
-                io = info.get("io_counters")
-                result[int(info["pid"])] = {
-                    "cpu_s": float(times.user + times.system),
-                    "read_bytes": int(getattr(io, "read_bytes", 0) or 0),
-                    "write_bytes": int(getattr(io, "write_bytes", 0) or 0),
-                }
+                result[int(info["pid"])] = {"cpu_s": float(times.user + times.system)}
             except (psutil.Error, AttributeError, TypeError, ValueError, KeyError):
                 continue
         return result
 
+    def _accumulate_process_peaks(self, grouped: dict[str, dict[str, Any]]) -> None:
+        """Keep short-lived CPU/RAM peaks until the next detailed snapshot."""
+        for program, row in grouped.items():
+            peak = self.pending_process_peaks.setdefault(program, {
+                "program": program, "category": row["category"],
+                "cpu_pct": 0.0, "ram_mb": 0.0, "read_mb_s": 0.0,
+                "write_mb_s": 0.0, "threads": 0, "instances": 0,
+            })
+            peak["cpu_pct"] = max(float(peak["cpu_pct"]), float(row.get("cpu_pct", 0.0)))
+            peak["ram_mb"] = max(float(peak["ram_mb"]), float(row.get("ram_mb", 0.0)))
+            peak["category"] = row.get("category", peak["category"])
+            peak["instances"] = int(row.get("instances", peak["instances"]))
+
     def _process_usage(self, elapsed: float, include_details: bool = True) -> dict[str, tuple[float, float]]:
-        if include_details and self.last_detailed_mode is False:
-            # Refresh I/O counters after detailed logging has been turned back on,
-            # otherwise the first sample could report an artificial I/O spike.
-            self.previous_proc = self._capture_process_baseline()
+        """Fast scan of CPU times/RAM; never queries per-process I/O or thread counts."""
+        if self.last_detailed_mode is False and include_details:
+            # Discard the old I/O baseline so re-enabling detail cannot create a false spike.
+            self.previous_detailed_io = {}
+            self.previous_detailed_at = None
+        if not include_details and self.last_detailed_mode is not False:
+            self.pending_process_peaks.clear()
+            self.previous_detailed_io = {}
+            self.previous_detailed_at = None
         self.last_detailed_mode = include_details
+
         cat_cpu: dict[str, float] = {c: 0.0 for c in CATEGORIES}
         cat_ram: dict[str, float] = {c: 0.0 for c in CATEGORIES}
         current: dict[int, dict[str, Any]] = {}
         grouped: dict[str, dict[str, Any]] = {}
         divisor = max(0.25, elapsed) * self.cpu_count
-        attrs = ["pid", "name", "cpu_times", "memory_info"]
-        if include_details:
-            attrs.extend(["io_counters", "num_threads"])
-        for proc in psutil.process_iter(attrs=attrs):
+        for proc in psutil.process_iter(attrs=["pid", "name", "cpu_times", "memory_info"]):
             try:
                 info = proc.info
                 pid = int(info["pid"])
                 program = safe_program_name(info.get("name"))
                 category = safe_category(program)
-                times, io, mem = info.get("cpu_times"), info.get("io_counters"), info.get("memory_info")
+                times, mem = info.get("cpu_times"), info.get("memory_info")
                 cpu_s = float(times.user + times.system) if times is not None else 0.0
-                read_bytes = int(getattr(io, "read_bytes", 0) or 0)
-                write_bytes = int(getattr(io, "write_bytes", 0) or 0)
                 old = self.previous_proc.get(pid)
-                cpu_pct = read_mb_s = write_mb_s = 0.0
-                if old:
-                    cpu_pct = max(0.0, cpu_s - old["cpu_s"]) / divisor * 100
-                    read_mb_s = max(0, read_bytes - old["read_bytes"]) / max(0.25, elapsed) / (1024 * 1024)
-                    write_mb_s = max(0, write_bytes - old["write_bytes"]) / max(0.25, elapsed) / (1024 * 1024)
+                cpu_pct = max(0.0, cpu_s - old["cpu_s"]) / divisor * 100 if old else 0.0
                 ram_mb = float(mem.rss) / (1024 * 1024) if mem else 0.0
-                current[pid] = {"cpu_s": cpu_s, "read_bytes": read_bytes, "write_bytes": write_bytes}
+                current[pid] = {"cpu_s": cpu_s}
                 cat_cpu[category] += cpu_pct
                 cat_ram[category] += ram_mb
                 if include_details:
-                    row = grouped.setdefault(program, {"program": program, "category": category, "cpu_pct": 0.0, "ram_mb": 0.0, "read_mb_s": 0.0, "write_mb_s": 0.0, "threads": 0, "instances": 0})
+                    row = grouped.setdefault(program, {
+                        "program": program, "category": category, "cpu_pct": 0.0,
+                        "ram_mb": 0.0, "instances": 0,
+                    })
                     row["cpu_pct"] += cpu_pct
                     row["ram_mb"] += ram_mb
-                    row["read_mb_s"] += read_mb_s
-                    row["write_mb_s"] += write_mb_s
-                    row["threads"] += int(info.get("num_threads") or 0)
                     row["instances"] += 1
             except (psutil.Error, AttributeError, TypeError, ValueError, KeyError):
                 continue
         self.previous_proc = current
         if include_details:
-            names: set[str] = set()
-            rows = list(grouped.values())
-            for metric in ("cpu_pct", "ram_mb", "read_mb_s", "write_mb_s"):
-                names.update(r["program"] for r in sorted(rows, key=lambda x: x[metric], reverse=True)[:12])
-            names.update(r["program"] for r in rows if r["cpu_pct"] >= 0.5 or r["ram_mb"] >= 75 or r["read_mb_s"] >= 0.25 or r["write_mb_s"] >= 0.25)
-            rows = [r for r in rows if r["program"] in names]
-            rows.sort(key=lambda r: max(r["cpu_pct"], r["ram_mb"] / 16, r["read_mb_s"] * 10, r["write_mb_s"] * 10), reverse=True)
-            self.last_process_rows = [
-                {"program": r["program"], "category": r["category"], "cpu_pct": round(r["cpu_pct"], 2),
-                 "ram_mb": round(r["ram_mb"], 1), "read_mb_s": round(r["read_mb_s"], 3),
-                 "write_mb_s": round(r["write_mb_s"], 3), "threads": r["threads"], "instances": r["instances"]}
-                for r in rows[:MAX_PROCESS_ROWS]
-            ]
+            self._accumulate_process_peaks(grouped)
         else:
+            self.pending_process_peaks.clear()
             self.last_process_rows = []
         return {c: (round(cat_cpu[c], 1), round(cat_ram[c], 1)) for c in CATEGORIES}
+
+    def capture_process_snapshot(self) -> list[dict[str, Any]]:
+        """Capture current I/O/thread details and merge them with CPU/RAM peaks since last snapshot."""
+        now = time.monotonic()
+        elapsed = max(0.5, now - self.previous_detailed_at) if self.previous_detailed_at is not None else 0.0
+        current_io: dict[int, dict[str, Any]] = {}
+        detailed_by_program: dict[str, dict[str, Any]] = {}
+        for proc in psutil.process_iter(attrs=["pid", "name", "io_counters", "num_threads", "memory_info"]):
+            try:
+                info = proc.info
+                pid = int(info["pid"])
+                program = safe_program_name(info.get("name"))
+                category = safe_category(program)
+                io = info.get("io_counters")
+                read_bytes = int(getattr(io, "read_bytes", 0) or 0)
+                write_bytes = int(getattr(io, "write_bytes", 0) or 0)
+                old = self.previous_detailed_io.get(pid)
+                read_mb_s = write_mb_s = 0.0
+                if old is not None and elapsed > 0:
+                    read_mb_s = max(0, read_bytes - old["read_bytes"]) / elapsed / (1024 * 1024)
+                    write_mb_s = max(0, write_bytes - old["write_bytes"]) / elapsed / (1024 * 1024)
+                current_io[pid] = {
+                    "program": program, "read_bytes": read_bytes, "write_bytes": write_bytes,
+                }
+                mem = info.get("memory_info")
+                ram_mb = float(mem.rss) / (1024 * 1024) if mem else 0.0
+                row = detailed_by_program.setdefault(program, {
+                    "program": program, "category": category, "read_mb_s": 0.0,
+                    "write_mb_s": 0.0, "ram_mb": 0.0, "threads": 0, "instances": 0,
+                })
+                row["read_mb_s"] += read_mb_s
+                row["write_mb_s"] += write_mb_s
+                row["ram_mb"] += ram_mb
+                row["threads"] += int(info.get("num_threads") or 0)
+                row["instances"] += 1
+            except (psutil.Error, AttributeError, TypeError, ValueError, KeyError):
+                continue
+
+        self.previous_detailed_io = current_io
+        self.previous_detailed_at = now
+        for program, row in detailed_by_program.items():
+            peak = self.pending_process_peaks.setdefault(program, {
+                "program": program, "category": row["category"], "cpu_pct": 0.0,
+                "ram_mb": 0.0, "read_mb_s": 0.0, "write_mb_s": 0.0,
+                "threads": 0, "instances": 0,
+            })
+            peak["ram_mb"] = max(float(peak["ram_mb"]), float(row["ram_mb"]))
+            # These are averages between detailed snapshots, not instantaneous disk rates.
+            peak["read_mb_s"] = float(row["read_mb_s"])
+            peak["write_mb_s"] = float(row["write_mb_s"])
+            peak["threads"] = int(row["threads"])
+            peak["instances"] = int(row["instances"])
+
+        rows = list(self.pending_process_peaks.values())
+        rows.sort(
+            key=lambda r: max(
+                float(r.get("cpu_pct", 0)),
+                float(r.get("ram_mb", 0)) / 16,
+                float(r.get("read_mb_s", 0)) * 10,
+                float(r.get("write_mb_s", 0)) * 10,
+            ),
+            reverse=True,
+        )
+        self.last_process_rows = [
+            {
+                "program": row["program"], "category": row["category"],
+                "cpu_pct": round(float(row.get("cpu_pct", 0)), 2),
+                "ram_mb": round(float(row.get("ram_mb", 0)), 1),
+                "read_mb_s": round(float(row.get("read_mb_s", 0)), 3),
+                "write_mb_s": round(float(row.get("write_mb_s", 0)), 3),
+                "threads": int(row.get("threads", 0)),
+                "instances": int(row.get("instances", 0)),
+            }
+            for row in rows[:MAX_PROCESS_ROWS]
+        ]
+        self.pending_process_peaks.clear()
+        return self.last_process_rows
 
     @staticmethod
     def _disk_usage_pct() -> float:
@@ -295,8 +371,10 @@ class Collector:
             w_ops = max(0, disk.write_count - self.previous_disk.write_count)
             r_ms = max(0, getattr(disk, "read_time", 0) - getattr(self.previous_disk, "read_time", 0))
             w_ms = max(0, getattr(disk, "write_time", 0) - getattr(self.previous_disk, "write_time", 0))
-            if r_ops: read_latency = r_ms / r_ops
-            if w_ops: write_latency = w_ms / w_ops
+            if r_ops:
+                read_latency = r_ms / r_ops
+            if w_ops:
+                write_latency = w_ms / w_ops
             busy_pct = min(100.0, (r_ms + w_ms) / (elapsed * 1000) * 100)
         self.previous_disk = disk
         recv_mb_s = sent_mb_s = 0.0
@@ -630,8 +708,9 @@ class SlowWatchApp:
         if not self.detailed_process_var.get() or self.collector is None:
             return
         stamp = timestamp or dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        process_rows = self.collector.capture_process_snapshot()
         rows = []
-        for process_row in self.collector.last_process_rows:
+        for process_row in process_rows:
             saved = dict(process_row)
             saved["timestamp"] = stamp
             rows.append(saved)
