@@ -5,6 +5,7 @@
   const SAMPLE_INTERVAL_MS = 15000;
   const tabRef = crypto.randomUUID();
   let longTaskCount = 0, longTaskMs = 0;
+  let resourceEntriesSeen = 0, transferBytesTotal = 0;
 
   try {
     if ("PerformanceObserver" in window) {
@@ -61,13 +62,20 @@
         const host = String(location.hostname || "").toLowerCase();
         if (!host || host === "localhost" || host === "127.0.0.1") return;
         const resources = performance.getEntriesByType("resource");
-        let transferBytes = 0;
-        for (const entry of resources) transferBytes += Math.max(0, Number(entry.transferSize || entry.encodedBodySize || 0));
+        // Only sum resource entries not seen in previous samples; old code re-summed
+        // the whole resource list every 15 seconds on every open tab.
+        const resourceStart = resources.length >= resourceEntriesSeen ? resourceEntriesSeen : 0;
+        if (resourceStart === 0 && resourceEntriesSeen > 0) transferBytesTotal = 0;
+        for (let i = resourceStart; i < resources.length; i++) {
+          const entry = resources[i];
+          transferBytesTotal += Math.max(0, Number(entry.transferSize || entry.encodedBodySize || 0));
+        }
+        resourceEntriesSeen = resources.length;
         const nav = performance.getEntriesByType("navigation")[0], mem = performance.memory;
         const sample = {
           tab_ref: tabRef, site_label: siteLabel(host), site_category: categoryFor(host), mail_thread_id: gmailThreadId(host),
           visible: document.visibilityState === "visible", resource_count: resources.length,
-          transfer_kb: Math.round((transferBytes / 1024) * 100) / 100,
+          transfer_kb: Math.round((transferBytesTotal / 1024) * 100) / 100,
           long_task_count: longTaskCount, long_task_ms: Math.round(longTaskMs * 100) / 100,
           js_heap_mb: mem && Number.isFinite(mem.usedJSHeapSize) ? Math.round((mem.usedJSHeapSize / (1024 * 1024)) * 100) / 100 : 0,
           dom_nodes: document.getElementsByTagName("*").length,
