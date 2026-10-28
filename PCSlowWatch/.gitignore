@@ -5,3 +5,7 @@ venv/
 *.zip
 *.csv
 *.log
+
+# Local PC Slow Watch exports
+PCSlowWatch_AI_Report_*.zip
+PCSlowWatch-browser-*.json
