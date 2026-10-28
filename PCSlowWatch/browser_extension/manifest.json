@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "PC Slow Watch — Browser Monitor",
+  "version": "0.2.0",
+  "description": "Local browser-tab performance samples for PC Slow Watch. Does not collect page text or full URLs.",
+  "permissions": ["storage", "downloads"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {"service_worker": "service_worker.js"},
+  "action": {"default_title": "PC Slow Watch", "default_popup": "popup.html"},
+  "content_scripts": [{"matches": ["http://*/*", "https://*/*"], "js": ["content.js"], "run_at": "document_idle", "all_frames": false}]
+}
