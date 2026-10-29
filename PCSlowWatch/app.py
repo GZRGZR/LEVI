@@ -199,7 +199,7 @@ def safe_error_message(exc: BaseException) -> str:
     """Short local diagnostic text with common local paths redacted."""
     message = " ".join(str(exc).split())
     message = re.sub(
-        r"(?i)\b[A-Z]:\\(?:[^\\/:*?""<>|\\s]+\\)*[^\\/:*?""<>|\\s]*",
+        r'(?i)\b[A-Z]:\\(?:[^\\/:*?"<>|\s]+\\)*[^\\/:*?"<>|\s]*',
         "[נתיב מקומי]",
         message,
     )
