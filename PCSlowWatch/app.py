@@ -451,8 +451,8 @@ class SlowWatchApp:
         self.interval_box = ttk.Combobox(controls, width=5, state="readonly", values=(2, 5, 10), textvariable=self.sample_interval)
         self.interval_box.pack(side="right")
 
-        extras = tk.Frame(self.root, bg="#f3f5f8", padx=18, pady=(0, 8))
-        extras.pack(fill="x")
+        extras = tk.Frame(self.root, bg="#f3f5f8", padx=18)
+        extras.pack(fill="x", pady=(0, 8))
         ttk.Checkbutton(
             extras, text="שמירת פירוט תוכנות ותהליכים (ברירת מחדל פעיל)",
             variable=self.detailed_process_var
