@@ -16,6 +16,17 @@ spec.loader.exec_module(module)
 
 
 class PrivacyCategoryTests(unittest.TestCase):
+    @unittest.skipIf(module.psutil is None, "psutil dependency unavailable")
+    def test_process_enumeration_runtime_error_does_not_escape(self):
+        with mock.patch.object(module.psutil, "process_iter", side_effect=RuntimeError("enumeration failed")):
+            self.assertEqual(list(module.safe_process_iter(["pid"])), [])
+
+    def test_diagnostic_error_message_redacts_local_paths(self):
+        message = module.safe_error_message(RuntimeError(r"C:\Users\OWNER\Private\app.py failed"))
+        self.assertNotIn("OWNER", message)
+        self.assertNotIn("Private", message)
+        self.assertIn("[נתיב מקומי]", message)
+
     def test_categories_are_broad_and_generic(self):
         self.assertEqual(module.safe_category("msedge.exe"), "browser")
         self.assertEqual(module.safe_category("MsMpEng.exe"), "security")
