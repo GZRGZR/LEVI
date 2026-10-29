@@ -42,6 +42,28 @@ class PrivacyCategoryTests(unittest.TestCase):
         self.assertEqual(module.pct("12.34"), 12.3)
         self.assertEqual(module.pct(None), 0.0)
 
+    @unittest.skipIf(module.psutil is None, "psutil dependency unavailable")
+    def test_swap_usage_uses_psutil_counter_when_available(self):
+        with mock.patch.object(module.psutil, "swap_memory", return_value=SimpleNamespace(percent=27.4)):
+            self.assertEqual(module.swap_usage_percent(), (27.4, False))
+
+    @unittest.skipIf(module.psutil is None, "psutil dependency unavailable")
+    def test_swap_usage_falls_back_when_windows_pdh_counter_is_disabled(self):
+        error = RuntimeError("PdhAddEnglishCounterW failed. Performance counters may be disabled.")
+        with (
+            mock.patch.object(module.platform, "system", return_value="Windows"),
+            mock.patch.object(module.psutil, "swap_memory", side_effect=error),
+            mock.patch.object(module, "windows_commit_usage_percent", return_value=63.2),
+        ):
+            self.assertEqual(module.swap_usage_percent(), (63.2, True))
+
+    @unittest.skipIf(module.psutil is None, "psutil dependency unavailable")
+    def test_unrelated_swap_errors_are_not_hidden(self):
+        error = RuntimeError("unexpected swap failure")
+        with mock.patch.object(module.psutil, "swap_memory", side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, "unexpected swap failure"):
+                module.swap_usage_percent()
+
     def test_program_name_drops_directories_and_path(self):
         self.assertEqual(module.safe_program_name(r"C:\Users\PrivateName\App\chrome.exe"), "chrome.exe")
         self.assertNotIn("PrivateName", module.safe_program_name(r"C:\Users\PrivateName\App\chrome.exe"))
