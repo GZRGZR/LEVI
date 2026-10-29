@@ -175,6 +175,38 @@ def read_csv_rows(paths: list[Path]) -> list[dict[str, str]]:
     return rows
 
 
+def safe_process_iter(attrs: list[str]):
+    """Enumerate processes defensively; one Windows enumeration error must not stop system metrics."""
+    if psutil is None:
+        return
+    try:
+        iterator = iter(psutil.process_iter(attrs=attrs))
+    except Exception:
+        return
+    while True:
+        try:
+            process = next(iterator)
+        except StopIteration:
+            return
+        except Exception:
+            # Some Windows process-enumeration errors occur while advancing the iterator.
+            # Stop this partial process scan but allow overall CPU/RAM collection to continue.
+            return
+        yield process
+
+
+def safe_error_message(exc: BaseException) -> str:
+    """Short local diagnostic text with common local paths redacted."""
+    message = " ".join(str(exc).split())
+    message = re.sub(
+        r"(?i)\b[A-Z]:\\(?:[^\\/:*?""<>|\\s]+\\)*[^\\/:*?""<>|\\s]*",
+        "[נתיב מקומי]",
+        message,
+    )
+    message = re.sub(r"\\\\[^\\\s]+\\[^\\\s]+(?:\\[^\s]+)*", "[נתיב רשת]", message)
+    return message[:140] or "לא סופק פירוט"
+
+
 class Collector:
     """Collect fast system/CPU/RAM metrics often; query process I/O and threads only on snapshots."""
     def __init__(self) -> None:
@@ -198,14 +230,14 @@ class Collector:
 
     def _capture_process_baseline(self) -> dict[int, dict[str, Any]]:
         result: dict[int, dict[str, Any]] = {}
-        for proc in psutil.process_iter(attrs=["pid", "name", "cpu_times"]):
+        for proc in safe_process_iter(["pid", "name", "cpu_times"]):
             try:
                 info = proc.info
                 times = info.get("cpu_times")
                 if times is None:
                     continue
                 result[int(info["pid"])] = {"cpu_s": float(times.user + times.system)}
-            except (psutil.Error, AttributeError, TypeError, ValueError, KeyError):
+            except Exception:
                 continue
         return result
 
@@ -239,7 +271,7 @@ class Collector:
         current: dict[int, dict[str, Any]] = {}
         grouped: dict[str, dict[str, Any]] = {}
         divisor = max(0.25, elapsed) * self.cpu_count
-        for proc in psutil.process_iter(attrs=["pid", "name", "cpu_times", "memory_info"]):
+        for proc in safe_process_iter(["pid", "name", "cpu_times", "memory_info"]):
             try:
                 info = proc.info
                 pid = int(info["pid"])
@@ -261,7 +293,7 @@ class Collector:
                     row["cpu_pct"] += cpu_pct
                     row["ram_mb"] += ram_mb
                     row["instances"] += 1
-            except (psutil.Error, AttributeError, TypeError, ValueError, KeyError):
+            except Exception:
                 continue
         self.previous_proc = current
         if include_details:
@@ -277,7 +309,7 @@ class Collector:
         elapsed = max(0.5, now - self.previous_detailed_at) if self.previous_detailed_at is not None else 0.0
         current_io: dict[int, dict[str, Any]] = {}
         detailed_by_program: dict[str, dict[str, Any]] = {}
-        for proc in psutil.process_iter(attrs=["pid", "name", "io_counters", "num_threads", "memory_info"]):
+        for proc in safe_process_iter(["pid", "name", "io_counters", "num_threads", "memory_info"]):
             try:
                 info = proc.info
                 pid = int(info["pid"])
@@ -305,7 +337,7 @@ class Collector:
                 row["ram_mb"] += ram_mb
                 row["threads"] += int(info.get("num_threads") or 0)
                 row["instances"] += 1
-            except (psutil.Error, AttributeError, TypeError, ValueError, KeyError):
+            except Exception:
                 continue
 
         self.previous_detailed_io = current_io
@@ -361,7 +393,9 @@ class Collector:
         now = time.monotonic()
         elapsed = max(0.25, now - self.previous_time)
         self.previous_time = now
+        self.last_stage = "מדידת CPU וזיכרון"
         cpu, vm, swap = pct(psutil.cpu_percent(interval=None)), psutil.virtual_memory(), psutil.swap_memory()
+        self.last_stage = "מדידת דיסק ורשת"
         disk, net = psutil.disk_io_counters(), psutil.net_io_counters()
         read_mb_s = write_mb_s = busy_pct = read_latency = write_latency = 0.0
         if disk is not None and self.previous_disk is not None:
@@ -382,7 +416,9 @@ class Collector:
             recv_mb_s = max(0.0, net.bytes_recv - self.previous_net.bytes_recv) / elapsed / (1024 * 1024)
             sent_mb_s = max(0.0, net.bytes_sent - self.previous_net.bytes_sent) / elapsed / (1024 * 1024)
         self.previous_net = net
+        self.last_stage = "סריקת תהליכים"
         cats = self._process_usage(elapsed, include_details=detailed_processes)
+        self.last_stage = "הרכבת מדדי המערכת"
         top_cpu = max(cats, key=lambda k: cats[k][0])
         top_ram = max(cats, key=lambda k: cats[k][1])
         result: dict[str, Any] = {
@@ -578,10 +614,38 @@ class SlowWatchApp:
     def _tick(self) -> None:
         if not self.running or self.collector is None:
             return
+
         try:
             row = self.collector.sample(detailed_processes=self.detailed_process_var.get())
+        except Exception as exc:
+            phase = getattr(self.collector, "last_stage", "מדדי מערכת")
+            self._set_status(
+                f"הדגימה נכשלה בשלב {phase} ({type(exc).__name__}: "
+                f"{safe_error_message(exc)}); האיסוף ינסה שוב."
+            )
+        else:
             self.current = row
-            self._append_row(self._path("metrics"), METRIC_FIELDS, row)
+            self.history.append(row)
+            problems: list[tuple[str, Exception]] = []
+
+            # Show the core system sample before optional persistence or process details.
+            ui_steps = (
+                ("כרטיסי המדדים", lambda: self._update_cards(row)),
+                ("אבחון המדדים", lambda: self._update_diagnosis(row)),
+                ("הגרף", self._draw_chart),
+                ("רישום התראות", lambda: self._check_alerts(row)),
+            )
+            for label, action in ui_steps:
+                try:
+                    action()
+                except Exception as exc:
+                    problems.append((label, exc))
+
+            try:
+                self._append_row(self._path("metrics"), METRIC_FIELDS, row)
+            except Exception as exc:
+                problems.append(("שמירת מדדי המערכת", exc))
+
             now_monotonic = time.monotonic()
             high_load = (
                 row["cpu_pct"] >= 85
@@ -601,19 +665,33 @@ class SlowWatchApp:
                     or now_monotonic - self.last_process_log_at >= process_interval
                 )
             ):
-                self._save_process_snapshot(row["timestamp"])
-                self.last_process_log_at = now_monotonic
+                try:
+                    self._save_process_snapshot(row["timestamp"])
+                except Exception as exc:
+                    problems.append(("פירוט התוכנות", exc))
+                finally:
+                    # Avoid retrying an optional, failing process snapshot every few seconds.
+                    self.last_process_log_at = now_monotonic
+
             if now_monotonic - self.last_cleanup_at >= CLEANUP_INTERVAL_SECONDS:
-                self._cleanup_old_data()
-                self.last_cleanup_at = now_monotonic
-            self.history.append(row)
-            self._update_cards(row)
-            self._update_diagnosis(row)
-            self._draw_chart()
-            self._check_alerts(row)
-            self._set_status(f"איסוף פעיל • דגימה אחרונה: {row['timestamp']} • שמירה מקומית בלבד")
-        except Exception as exc:
-            self._set_status(f"הדגימה נכשלה ({type(exc).__name__}); האיסוף ינסה שוב.")
+                try:
+                    self._cleanup_old_data()
+                except Exception as exc:
+                    problems.append(("ניקוי נתונים ישנים", exc))
+                finally:
+                    self.last_cleanup_at = now_monotonic
+
+            if problems:
+                label, exc = problems[0]
+                self._set_status(
+                    f"המדדים ממשיכים להתעדכן; תקלה ב{label} "
+                    f"({type(exc).__name__}: {safe_error_message(exc)})."
+                )
+            else:
+                self._set_status(
+                    f"איסוף פעיל • דגימה אחרונה: {row['timestamp']} • שמירה מקומית בלבד"
+                )
+
         self.after_id = self.root.after(int(self.sample_interval.get() * 1000), self._tick)
 
     def _update_cards(self, row: dict[str, Any]) -> None:
