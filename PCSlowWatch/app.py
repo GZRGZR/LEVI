@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import ctypes
 import datetime as dt
 import json
 import os
@@ -157,6 +158,61 @@ def sanitize_browser_sample(sample: Any) -> dict[str, Any] | None:
     }
 
 
+def windows_commit_usage_percent() -> float:
+    """Estimate Windows virtual-memory commit pressure without PDH page-file counters."""
+    if platform.system() != "Windows":
+        raise RuntimeError("Windows commit fallback is available only on Windows.")
+
+    class PerformanceInformation(ctypes.Structure):
+        _fields_ = [
+            ("cb", ctypes.c_ulong),
+            ("CommitTotal", ctypes.c_size_t),
+            ("CommitLimit", ctypes.c_size_t),
+            ("CommitPeak", ctypes.c_size_t),
+            ("PhysicalTotal", ctypes.c_size_t),
+            ("PhysicalAvailable", ctypes.c_size_t),
+            ("SystemCache", ctypes.c_size_t),
+            ("KernelTotal", ctypes.c_size_t),
+            ("KernelPaged", ctypes.c_size_t),
+            ("KernelNonpaged", ctypes.c_size_t),
+            ("PageSize", ctypes.c_size_t),
+            ("HandleCount", ctypes.c_ulong),
+            ("ProcessCount", ctypes.c_ulong),
+            ("ThreadCount", ctypes.c_ulong),
+        ]
+
+    info = PerformanceInformation()
+    info.cb = ctypes.sizeof(info)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    get_performance_info = psapi.GetPerformanceInfo
+    get_performance_info.argtypes = [
+        ctypes.POINTER(PerformanceInformation),
+        ctypes.c_ulong,
+    ]
+    get_performance_info.restype = ctypes.c_int
+    if not get_performance_info(ctypes.byref(info), info.cb):
+        error_code = ctypes.get_last_error()
+        raise OSError(error_code, "GetPerformanceInfo failed")
+    if info.CommitLimit <= 0:
+        raise RuntimeError("Windows reported an invalid commit limit.")
+    return round(min(100.0, max(0.0, info.CommitTotal / info.CommitLimit * 100.0)), 1)
+
+
+def swap_usage_percent() -> tuple[float, bool]:
+    """Return page-file usage; fall back to an explicitly marked commit-pressure estimate."""
+    if psutil is None:
+        raise RuntimeError("psutil is unavailable.")
+    try:
+        return round(float(psutil.swap_memory().percent), 1), False
+    except RuntimeError as exc:
+        if (
+            platform.system() != "Windows"
+            or "PdhAddEnglishCounterW failed" not in str(exc)
+        ):
+            raise
+        return windows_commit_usage_percent(), True
+
+
 def pct(value: Any) -> float:
     try:
         return round(float(value), 1)
@@ -225,6 +281,8 @@ class Collector:
         self.pending_process_peaks: dict[str, dict[str, Any]] = {}
         self.last_process_rows: list[dict[str, Any]] = []
         self.last_detailed_mode: bool | None = None
+        self.swap_pct_used_estimate = False
+        self.swap_pct_is_commit_estimate = False
         psutil.cpu_percent(interval=None)
         self.previous_time = time.monotonic()
 
@@ -394,7 +452,11 @@ class Collector:
         elapsed = max(0.25, now - self.previous_time)
         self.previous_time = now
         self.last_stage = "מדידת CPU וזיכרון"
-        cpu, vm, swap = pct(psutil.cpu_percent(interval=None)), psutil.virtual_memory(), psutil.swap_memory()
+        cpu = pct(psutil.cpu_percent(interval=None))
+        vm = psutil.virtual_memory()
+        swap_pct, swap_is_estimate = swap_usage_percent()
+        self.swap_pct_is_commit_estimate = swap_is_estimate
+        self.swap_pct_used_estimate = self.swap_pct_used_estimate or swap_is_estimate
         self.last_stage = "מדידת דיסק ורשת"
         disk, net = psutil.disk_io_counters(), psutil.net_io_counters()
         read_mb_s = write_mb_s = busy_pct = read_latency = write_latency = 0.0
@@ -425,7 +487,7 @@ class Collector:
             "timestamp": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
             "cpu_pct": round(cpu, 1), "ram_pct": round(vm.percent, 1),
             "ram_used_mb": round(vm.used / (1024 * 1024), 1), "ram_available_mb": round(vm.available / (1024 * 1024), 1),
-            "swap_pct": round(swap.percent, 1), "disk_read_mb_s": round(read_mb_s, 3), "disk_write_mb_s": round(write_mb_s, 3),
+            "swap_pct": round(swap_pct, 1), "swap_pct_is_commit_estimate": swap_is_estimate, "disk_read_mb_s": round(read_mb_s, 3), "disk_write_mb_s": round(write_mb_s, 3),
             "disk_busy_pct_est": round(busy_pct, 1), "disk_read_latency_ms": round(read_latency, 1), "disk_write_latency_ms": round(write_latency, 1),
             "network_recv_mb_s": round(recv_mb_s, 3), "network_sent_mb_s": round(sent_mb_s, 3),
             "system_drive_free_pct": self._disk_usage_pct(), "uptime_hours": round(max(0.0, time.time() - self.boot_time) / 3600, 1),
@@ -722,7 +784,9 @@ class SlowWatchApp:
             f"{headline}\n\nקטגוריה עם שימוש המעבד הגבוה ביותר: {cpu_cat}.\n"
             f"קטגוריה עם שימוש הזיכרון הגבוה ביותר: {ram_cat}.\n"
             f"זיכרון פנוי: {row['ram_available_mb'] / 1024:.1f} GB • פנוי בכונן המערכת: {row['system_drive_free_pct']:.0f}%\n"
-            "פירוט תוכנות נשמר בקובץ נפרד אם האפשרות מופעלת; נשמר רק שם קובץ ההפעלה, לא נתיב או שורת פקודה."
+            + ("הערה: מדד הזיכרון הווירטואלי הוא אומדן של עומס ה־commit ב-Windows, כי מונה קובץ ההחלפה אינו זמין.\n"
+               if row.get("swap_pct_is_commit_estimate") else "")
+            + "פירוט תוכנות נשמר בקובץ נפרד אם האפשרות מופעלת; נשמר רק שם קובץ ההפעלה, לא נתיב או שורת פקודה."
         )
 
     def _draw_chart(self) -> None:
@@ -852,6 +916,11 @@ class SlowWatchApp:
             "collection_interval_seconds": self.sample_interval.get(),
             "report_period_days": EXPORT_DAYS,
             "privacy_note": "No hostname, username, IP/MAC address, PID, command line, filesystem paths, full URLs, page titles, email subjects/content, keystrokes, or file contents are included. Heavy executable basenames, site domains, and Gmail thread IDs may be included.",
+            "swap_metric_note": (
+                "Windows commit usage was used as an estimate because the Windows PDH page-file counter was unavailable during this run."
+                if self.collector is not None and getattr(self.collector, "swap_pct_used_estimate", False)
+                else "Swap percentage comes from psutil's Windows page-file counter."
+            ),
         }
         try:
             drive = os.environ.get("SystemDrive", "C:")
